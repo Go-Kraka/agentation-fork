@@ -27,6 +27,7 @@ export type Annotation = {
     width: number;
     height: number;
   }>; // Individual bounding boxes for multi-select hover highlighting
+  drawingIndex?: number; // Index of linked drawing stroke (click-to-annotate)
 
   // Protocol fields (added when syncing to server)
   sessionId?: string;

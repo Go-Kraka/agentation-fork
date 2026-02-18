@@ -38,6 +38,7 @@ import {
   IconEdit,
   IconChevronLeft,
   IconChevronRight,
+  IconPencil,
 } from "../icons";
 import {
   identifyElement,
@@ -235,6 +236,86 @@ function isElementFixed(element: HTMLElement): boolean {
     current = current.parentElement;
   }
   return false;
+}
+
+function findStrokeAtPoint(
+  x: number,
+  y: number,
+  strokes: Array<{ points: Array<{ x: number; y: number }>; fixed: boolean }>,
+  threshold = 12,
+): number | null {
+  const scrollY = window.scrollY;
+  // Reverse order — last drawn is on top
+  for (let i = strokes.length - 1; i >= 0; i--) {
+    const stroke = strokes[i];
+    if (stroke.points.length < 2) continue;
+    for (let j = 0; j < stroke.points.length - 1; j++) {
+      const a = stroke.points[j];
+      const b = stroke.points[j + 1];
+      // Convert to viewport coords
+      const ay = stroke.fixed ? a.y : a.y - scrollY;
+      const by = stroke.fixed ? b.y : b.y - scrollY;
+      const ax = a.x;
+      const bx = b.x;
+      // Point-to-segment distance
+      const dx = bx - ax;
+      const dy = by - ay;
+      const lenSq = dx * dx + dy * dy;
+      let t = lenSq === 0 ? 0 : ((x - ax) * dx + (y - ay) * dy) / lenSq;
+      t = Math.max(0, Math.min(1, t));
+      const projX = ax + t * dx;
+      const projY = ay + t * dy;
+      const dist = Math.hypot(x - projX, y - projY);
+      if (dist < threshold) return i;
+    }
+  }
+  return null;
+}
+
+function classifyStrokeGesture(
+  points: Array<{ x: number; y: number }>,
+  fixed: boolean,
+): string {
+  if (points.length < 2) return "Mark";
+  const scrollY = window.scrollY;
+  const viewportPoints = fixed
+    ? points
+    : points.map((p) => ({ x: p.x, y: p.y - scrollY }));
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of viewportPoints) {
+    minX = Math.min(minX, p.x);
+    minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x);
+    maxY = Math.max(maxY, p.y);
+  }
+  const bboxW = maxX - minX;
+  const bboxH = maxY - minY;
+  const bboxDiag = Math.hypot(bboxW, bboxH);
+
+  const start = viewportPoints[0];
+  const end = viewportPoints[viewportPoints.length - 1];
+  const startEndDist = Math.hypot(end.x - start.x, end.y - start.y);
+  const closedLoop = startEndDist < bboxDiag * 0.35;
+  const aspectRatio = bboxW / Math.max(bboxH, 1);
+
+  if (closedLoop && bboxDiag > 20) {
+    const edgeThreshold = Math.max(bboxW, bboxH) * 0.15;
+    let edgePoints = 0;
+    for (const p of viewportPoints) {
+      const nearLeft = p.x - minX < edgeThreshold;
+      const nearRight = maxX - p.x < edgeThreshold;
+      const nearTop = p.y - minY < edgeThreshold;
+      const nearBottom = maxY - p.y < edgeThreshold;
+      if ((nearLeft || nearRight) && (nearTop || nearBottom)) edgePoints++;
+    }
+    return edgePoints > viewportPoints.length * 0.15 ? "Box" : "Circle";
+  } else if (aspectRatio > 3 && bboxH < 40) {
+    return "Underline";
+  } else if (startEndDist > bboxDiag * 0.5) {
+    return "Arrow";
+  }
+  return "Drawing";
 }
 
 function hexToRgba(hex: string, alpha: number): string {
@@ -495,6 +576,7 @@ export function PageFeedbackToolbarCSS({
     multiSelectElements?: HTMLElement[];
     // Element reference for single-select (for live position queries)
     targetElement?: HTMLElement;
+    drawingIndex?: number;
   } | null>(null);
   const [copied, setCopied] = useState(false);
   const [sendState, setSendState] = useState<
@@ -529,6 +611,14 @@ export function PageFeedbackToolbarCSS({
   );
   const [isTransitioning, setIsTransitioning] = useState(false);
   const [tooltipsHidden, setTooltipsHidden] = useState(false);
+
+  // Draw mode state
+  const [isDrawMode, setIsDrawMode] = useState(false);
+  const [drawStrokes, setDrawStrokes] = useState<Array<{ points: Array<{x: number, y: number}>; color: string; fixed: boolean }>>([]);
+  const [hoveredDrawingIdx, setHoveredDrawingIdx] = useState<number | null>(null);
+  const drawCanvasRef = useRef<HTMLCanvasElement>(null);
+  const isDrawingRef = useRef(false);
+  const currentStrokeRef = useRef<Array<{x: number, y: number}>>([]);
 
   // Cmd+shift+click multi-select state
   const [pendingMultiSelectElements, setPendingMultiSelectElements] = useState<
@@ -1421,6 +1511,7 @@ export function PageFeedbackToolbarCSS({
       setShowSettings(false); // Close settings when toolbar closes
       setPendingMultiSelectElements([]); // Clear multi-select
       modifiersHeldRef.current = { cmd: false, shift: false }; // Reset modifier tracking
+      setIsDrawMode(false); // Exit draw mode
       if (isFrozen) {
         unfreezeAnimations();
       }
@@ -1487,17 +1578,37 @@ export function PageFeedbackToolbarCSS({
     };
   }, [isActive]);
 
+  // Cursor change when hovering a drawing stroke
+  useEffect(() => {
+    if (hoveredDrawingIdx !== null && isActive && !isDrawMode) {
+      document.body.style.cursor = "pointer";
+      return () => { document.body.style.cursor = ""; };
+    }
+  }, [hoveredDrawingIdx, isActive, isDrawMode]);
+
   // Handle mouse move
   useEffect(() => {
-    if (!isActive || pendingAnnotation) return;
+    if (!isActive || pendingAnnotation || isDrawMode) return;
 
     const handleMouseMove = (e: MouseEvent) => {
       // Use composedPath to get actual target inside shadow DOM
       const target = (e.composedPath()[0] || e.target) as HTMLElement;
       if (closestCrossingShadow(target, "[data-feedback-toolbar]")) {
         setHoverInfo(null);
+        setHoveredDrawingIdx(null);
         return;
       }
+
+      // Check if hovering over a completed drawing stroke
+      if (drawStrokes.length > 0) {
+        const strokeIdx = findStrokeAtPoint(e.clientX, e.clientY, drawStrokes);
+        if (strokeIdx !== null) {
+          setHoveredDrawingIdx(strokeIdx);
+          setHoverInfo(null);
+          return;
+        }
+      }
+      setHoveredDrawingIdx(null);
 
       const elementUnder = deepElementFromPoint(e.clientX, e.clientY);
       if (
@@ -1524,11 +1635,60 @@ export function PageFeedbackToolbarCSS({
 
     document.addEventListener("mousemove", handleMouseMove);
     return () => document.removeEventListener("mousemove", handleMouseMove);
-  }, [isActive, pendingAnnotation, effectiveReactMode]);
+  }, [isActive, pendingAnnotation, isDrawMode, effectiveReactMode, drawStrokes]);
+
+  // Start editing an annotation (right-click or click on drawing stroke)
+  const startEditAnnotation = useCallback((annotation: Annotation) => {
+    setEditingAnnotation(annotation);
+    setHoveredMarkerId(null);
+    setHoveredTargetElement(null);
+    setHoveredTargetElements([]);
+
+    // Try to find elements at the annotation's position(s) for live tracking
+    if (annotation.elementBoundingBoxes?.length) {
+      // Cmd+shift+click: find element at each bounding box center
+      const elements: HTMLElement[] = [];
+      for (const bb of annotation.elementBoundingBoxes) {
+        const centerX = bb.x + bb.width / 2;
+        const centerY = bb.y + bb.height / 2 - window.scrollY;
+        const el = deepElementFromPoint(centerX, centerY);
+        if (el) elements.push(el);
+      }
+      setEditingTargetElements(elements);
+      setEditingTargetElement(null);
+    } else if (annotation.boundingBox) {
+      // Single element
+      const bb = annotation.boundingBox;
+      const centerX = bb.x + bb.width / 2;
+      // Convert document coords to viewport coords (unless fixed)
+      const centerY = annotation.isFixed
+        ? bb.y + bb.height / 2
+        : bb.y + bb.height / 2 - window.scrollY;
+      const el = deepElementFromPoint(centerX, centerY);
+
+      // Validate found element's size roughly matches stored bounding box
+      if (el) {
+        const elRect = el.getBoundingClientRect();
+        const widthRatio = elRect.width / bb.width;
+        const heightRatio = elRect.height / bb.height;
+        if (widthRatio < 0.5 || heightRatio < 0.5) {
+          setEditingTargetElement(null);
+        } else {
+          setEditingTargetElement(el);
+        }
+      } else {
+        setEditingTargetElement(null);
+      }
+      setEditingTargetElements([]);
+    } else {
+      setEditingTargetElement(null);
+      setEditingTargetElements([]);
+    }
+  }, []);
 
   // Handle click
   useEffect(() => {
-    if (!isActive) return;
+    if (!isActive || isDrawMode) return;
 
     const handleClick = (e: MouseEvent) => {
       if (justFinishedDragRef.current) {
@@ -1542,6 +1702,104 @@ export function PageFeedbackToolbarCSS({
       if (closestCrossingShadow(target, "[data-feedback-toolbar]")) return;
       if (closestCrossingShadow(target, "[data-annotation-popup]")) return;
       if (closestCrossingShadow(target, "[data-annotation-marker]")) return;
+
+      // Check if clicking on a completed drawing stroke
+      if (drawStrokes.length > 0 && !pendingAnnotation && !editingAnnotation) {
+        const strokeIdx = findStrokeAtPoint(e.clientX, e.clientY, drawStrokes);
+        if (strokeIdx !== null) {
+          e.preventDefault();
+          e.stopPropagation();
+
+          // If annotation already exists for this drawing, open it in edit mode
+          const existingAnnotation = annotations.find(a => a.drawingIndex === strokeIdx);
+          if (existingAnnotation) {
+            startEditAnnotation(existingAnnotation);
+            return;
+          }
+
+          const stroke = drawStrokes[strokeIdx];
+          const scrollYNow = window.scrollY;
+
+          // Compute stroke bounding box in viewport coords
+          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+          for (const p of stroke.points) {
+            const vy = stroke.fixed ? p.y : p.y - scrollYNow;
+            minX = Math.min(minX, p.x);
+            minY = Math.min(minY, vy);
+            maxX = Math.max(maxX, p.x);
+            maxY = Math.max(maxY, vy);
+          }
+          const centerX = (minX + maxX) / 2;
+          const centerY = (minY + maxY) / 2;
+
+          // Temporarily hide canvas to find element underneath
+          const canvas = drawCanvasRef.current;
+          if (canvas) canvas.style.display = "none";
+          const elementUnder = deepElementFromPoint(centerX, centerY);
+          if (canvas) canvas.style.display = "";
+
+          const gestureShape = classifyStrokeGesture(stroke.points, stroke.fixed);
+          let name = `Drawing: ${gestureShape}`;
+          let path = "";
+          let reactComponents: string | null = null;
+          let nearbyText: string | undefined;
+          let cssClasses: string | undefined;
+          let fullPath: string | undefined;
+          let accessibility: string | undefined;
+          let computedStylesStr: string | undefined;
+          let computedStylesObj: Record<string, string> | undefined;
+          let nearbyElements: string | undefined;
+          let isFixed = stroke.fixed;
+          let boundingBox: { x: number; y: number; width: number; height: number } | undefined;
+
+          if (elementUnder) {
+            const info = identifyElementWithReact(elementUnder, effectiveReactMode);
+            name = `Drawing: ${gestureShape} → ${info.name}`;
+            path = info.path;
+            reactComponents = info.reactComponents;
+            nearbyText = getNearbyText(elementUnder);
+            cssClasses = getElementClasses(elementUnder);
+            fullPath = getFullElementPath(elementUnder);
+            accessibility = getAccessibilityInfo(elementUnder);
+            computedStylesStr = getForensicComputedStyles(elementUnder);
+            computedStylesObj = getDetailedComputedStyles(elementUnder);
+            nearbyElements = getNearbyElements(elementUnder);
+            const rect = elementUnder.getBoundingClientRect();
+            boundingBox = {
+              x: rect.left,
+              y: isFixed ? rect.top : rect.top + scrollYNow,
+              width: rect.width,
+              height: rect.height,
+            };
+          }
+
+          const x = (centerX / window.innerWidth) * 100;
+          const y = isFixed ? centerY : centerY + scrollYNow;
+
+          setPendingAnnotation({
+            x,
+            y,
+            clientY: centerY,
+            element: name,
+            elementPath: path,
+            boundingBox,
+            nearbyText,
+            cssClasses,
+            isFixed,
+            fullPath,
+            accessibility,
+            computedStyles: computedStylesStr,
+            computedStylesObj,
+            nearbyElements,
+            reactComponents: reactComponents ?? undefined,
+            targetElement: elementUnder ?? undefined,
+            drawingIndex: strokeIdx,
+          });
+          setHoverInfo(null);
+          setHoveredDrawingIdx(null);
+          return;
+        }
+      }
 
       // Handle cmd+shift+click for multi-element selection
       if (e.metaKey && e.shiftKey && !pendingAnnotation && !editingAnnotation) {
@@ -1670,11 +1928,15 @@ export function PageFeedbackToolbarCSS({
     return () => document.removeEventListener("click", handleClick, true);
   }, [
     isActive,
+    isDrawMode,
     pendingAnnotation,
     editingAnnotation,
     settings.blockInteractions,
     effectiveReactMode,
     pendingMultiSelectElements,
+    drawStrokes,
+    annotations,
+    startEditAnnotation,
   ]);
 
   // Cmd+shift+click multi-select: keyup listener for modifier release
@@ -1724,7 +1986,7 @@ export function PageFeedbackToolbarCSS({
 
   // Multi-select drag - mousedown
   useEffect(() => {
-    if (!isActive || pendingAnnotation) return;
+    if (!isActive || pendingAnnotation || isDrawMode) return;
 
     const handleMouseDown = (e: MouseEvent) => {
       // Use composedPath to get actual target inside shadow DOM
@@ -1784,7 +2046,7 @@ export function PageFeedbackToolbarCSS({
 
     document.addEventListener("mousedown", handleMouseDown);
     return () => document.removeEventListener("mousedown", handleMouseDown);
-  }, [isActive, pendingAnnotation]);
+  }, [isActive, pendingAnnotation, isDrawMode]);
 
   // Multi-select drag - mousemove (fully optimized with direct DOM updates)
   useEffect(() => {
@@ -2151,6 +2413,382 @@ export function PageFeedbackToolbarCSS({
     return () => document.removeEventListener("mouseup", handleMouseUp);
   }, [isActive, isDragging]);
 
+  // Draw mode: redraw helper
+  const redrawCanvas = useCallback((ctx: CanvasRenderingContext2D, strokes: typeof drawStrokes, hoveredIdx?: number | null) => {
+    const scrollY = window.scrollY;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+    ctx.save();
+    ctx.scale(dpr, dpr);
+    for (let si = 0; si < strokes.length; si++) {
+      const stroke = strokes[si];
+      if (stroke.points.length < 2) continue;
+      const isHovered = si === hoveredIdx;
+      const offsetY = stroke.fixed ? 0 : scrollY;
+      ctx.beginPath();
+      ctx.strokeStyle = isHovered ? stroke.color : stroke.color;
+      ctx.lineWidth = isHovered ? 5 : 3;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      if (isHovered) {
+        ctx.shadowColor = stroke.color;
+        ctx.shadowBlur = 6;
+      }
+      const p0 = stroke.points[0];
+      ctx.moveTo(p0.x, p0.y - offsetY);
+      // Quadratic curve smoothing through midpoints
+      for (let i = 1; i < stroke.points.length - 1; i++) {
+        const curr = stroke.points[i];
+        const next = stroke.points[i + 1];
+        const midX = (curr.x + next.x) / 2;
+        const midY = (curr.y + next.y - 2 * offsetY) / 2;
+        ctx.quadraticCurveTo(curr.x, curr.y - offsetY, midX, midY);
+      }
+      // Line to last point
+      const last = stroke.points[stroke.points.length - 1];
+      ctx.lineTo(last.x, last.y - offsetY);
+      ctx.stroke();
+      if (isHovered) {
+        ctx.shadowColor = "transparent";
+        ctx.shadowBlur = 0;
+      }
+    }
+    ctx.restore();
+  }, []);
+
+  // Draw mode: drawing logic (also handles hover/click-to-annotate on completed strokes)
+  const drawClickStartRef = useRef<{ x: number; y: number; strokeIdx: number | null } | null>(null);
+  useEffect(() => {
+    if (!isDrawMode || !isActive) return;
+
+    const canvas = drawCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const dpr = window.devicePixelRatio || 1;
+
+    const handleMouseDown = (e: MouseEvent) => {
+      // Check if clicking on an existing stroke
+      const strokeIdx = findStrokeAtPoint(e.clientX, e.clientY, drawStrokes);
+      drawClickStartRef.current = { x: e.clientX, y: e.clientY, strokeIdx };
+
+      isDrawingRef.current = true;
+      currentStrokeRef.current = [{ x: e.clientX, y: e.clientY }];
+      ctx.save();
+      ctx.scale(dpr, dpr);
+      ctx.beginPath();
+      ctx.strokeStyle = settings.annotationColor;
+      ctx.lineWidth = 3;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.moveTo(e.clientX, e.clientY);
+    };
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isDrawingRef.current) {
+        // Hover detection on completed strokes (not actively drawing)
+        const strokeIdx = findStrokeAtPoint(e.clientX, e.clientY, drawStrokes);
+        setHoveredDrawingIdx(strokeIdx);
+        canvas.style.cursor = strokeIdx !== null ? "pointer" : "crosshair";
+        return;
+      }
+      const point = { x: e.clientX, y: e.clientY };
+      const prev = currentStrokeRef.current[currentStrokeRef.current.length - 1];
+      // Skip points that are very close together (reduces jitter)
+      const dist = Math.hypot(point.x - prev.x, point.y - prev.y);
+      if (dist < 2) return;
+      currentStrokeRef.current.push(point);
+      // Quadratic curve to midpoint for smooth live drawing
+      const midX = (prev.x + point.x) / 2;
+      const midY = (prev.y + point.y) / 2;
+      ctx.quadraticCurveTo(prev.x, prev.y, midX, midY);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(midX, midY);
+    };
+
+    const handleMouseUp = (e: MouseEvent) => {
+      if (!isDrawingRef.current) return;
+      isDrawingRef.current = false;
+      ctx.restore();
+      const pts = currentStrokeRef.current;
+
+      // Detect click (not drag) on existing stroke — open annotation popup
+      const clickStart = drawClickStartRef.current;
+      if (clickStart && clickStart.strokeIdx !== null && pts.length <= 3) {
+        const movedDist = Math.hypot(e.clientX - clickStart.x, e.clientY - clickStart.y);
+        if (movedDist < 5) {
+          // It's a click on an existing stroke
+          currentStrokeRef.current = [];
+          drawClickStartRef.current = null;
+          // Redraw to clear any partial stroke artifact
+          redrawCanvas(ctx, drawStrokes, clickStart.strokeIdx);
+
+          const strokeIdx = clickStart.strokeIdx;
+
+          // If annotation already exists for this drawing, open it in edit mode
+          const existingAnnotation = annotations.find(a => a.drawingIndex === strokeIdx);
+          if (existingAnnotation) {
+            startEditAnnotation(existingAnnotation);
+            setHoveredDrawingIdx(null);
+            return;
+          }
+
+          const stroke = drawStrokes[strokeIdx];
+          const scrollYNow = window.scrollY;
+
+          // Compute bounding box in viewport coords
+          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+          for (const p of stroke.points) {
+            const vy = stroke.fixed ? p.y : p.y - scrollYNow;
+            minX = Math.min(minX, p.x);
+            minY = Math.min(minY, vy);
+            maxX = Math.max(maxX, p.x);
+            maxY = Math.max(maxY, vy);
+          }
+          const centerX = (minX + maxX) / 2;
+          const centerY = (minY + maxY) / 2;
+
+          // Temporarily hide canvas to find element underneath
+          canvas.style.display = "none";
+          const elementUnder = deepElementFromPoint(centerX, centerY);
+          canvas.style.display = "";
+
+          const gestureShape = classifyStrokeGesture(stroke.points, stroke.fixed);
+          let name = `Drawing: ${gestureShape}`;
+          let path = "";
+          let reactComponents: string | null = null;
+          let nearbyText: string | undefined;
+          let cssClasses: string | undefined;
+          let fullPath: string | undefined;
+          let accessibility: string | undefined;
+          let computedStylesStr: string | undefined;
+          let computedStylesObj: Record<string, string> | undefined;
+          let nearbyElements: string | undefined;
+          const isFixed = stroke.fixed;
+          let boundingBox: { x: number; y: number; width: number; height: number } | undefined;
+
+          if (elementUnder) {
+            const info = identifyElementWithReact(elementUnder, effectiveReactMode);
+            name = `Drawing: ${gestureShape} → ${info.name}`;
+            path = info.path;
+            reactComponents = info.reactComponents;
+            nearbyText = getNearbyText(elementUnder);
+            cssClasses = getElementClasses(elementUnder);
+            fullPath = getFullElementPath(elementUnder);
+            accessibility = getAccessibilityInfo(elementUnder);
+            computedStylesStr = getForensicComputedStyles(elementUnder);
+            computedStylesObj = getDetailedComputedStyles(elementUnder);
+            nearbyElements = getNearbyElements(elementUnder);
+            const rect = elementUnder.getBoundingClientRect();
+            boundingBox = {
+              x: rect.left,
+              y: isFixed ? rect.top : rect.top + scrollYNow,
+              width: rect.width,
+              height: rect.height,
+            };
+          }
+
+          const x = (centerX / window.innerWidth) * 100;
+          const y = isFixed ? centerY : centerY + scrollYNow;
+
+          setPendingAnnotation({
+            x,
+            y,
+            clientY: centerY,
+            element: name,
+            elementPath: path,
+            boundingBox,
+            nearbyText,
+            cssClasses,
+            isFixed,
+            fullPath,
+            accessibility,
+            computedStyles: computedStylesStr,
+            computedStylesObj,
+            nearbyElements,
+            reactComponents: reactComponents ?? undefined,
+            targetElement: elementUnder ?? undefined,
+            drawingIndex: strokeIdx,
+          });
+          setHoverInfo(null);
+          setHoveredDrawingIdx(null);
+          return;
+        }
+      }
+      drawClickStartRef.current = null;
+
+      if (pts.length > 1) {
+        // Determine if stroke is over fixed/sticky elements
+        // Check the bounding-box center — most reliable signal for what the stroke targets
+        canvas.style.display = "none";
+
+        const isElFixed = (el: HTMLElement): boolean => {
+          let node: HTMLElement | null = el;
+          while (node && node !== document.documentElement) {
+            const pos = getComputedStyle(node).position;
+            if (pos === "fixed" || pos === "sticky") return true;
+            node = node.parentElement;
+          }
+          return false;
+        };
+
+        // Bounding box center
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const p of pts) {
+          minX = Math.min(minX, p.x);
+          minY = Math.min(minY, p.y);
+          maxX = Math.max(maxX, p.x);
+          maxY = Math.max(maxY, p.y);
+        }
+        const centerX = (minX + maxX) / 2;
+        const centerY = (minY + maxY) / 2;
+        const centerEl = deepElementFromPoint(centerX, centerY);
+        let isFixed = centerEl ? isElFixed(centerEl) : false;
+
+        // If center is ambiguous (e.g. arrow spanning fixed→scrollable), sample edges too
+        if (!isFixed) {
+          let fixedCount = 0;
+          let totalSampled = 0;
+          const sampleCount = Math.min(6, pts.length);
+          const step = Math.max(1, Math.floor(pts.length / sampleCount));
+          for (let i = 0; i < pts.length; i += step) {
+            const el = deepElementFromPoint(pts[i].x, pts[i].y);
+            if (!el) continue;
+            totalSampled++;
+            if (isElFixed(el)) fixedCount++;
+          }
+          // If majority of edge samples are fixed, override
+          if (totalSampled > 0 && fixedCount > totalSampled * 0.6) isFixed = true;
+        }
+
+        // Fixed strokes stay in viewport coords; scrollable strokes convert to page coords
+        const finalPoints = isFixed
+          ? [...pts]
+          : pts.map(p => ({ x: p.x, y: p.y + window.scrollY }));
+
+        const newStrokeIdx = drawStrokes.length;
+        const newStroke = { points: finalPoints, color: settings.annotationColor, fixed: isFixed };
+
+        // Identify element underneath for annotation
+        const gestureShape = classifyStrokeGesture(finalPoints, isFixed);
+        let name = `Drawing: ${gestureShape}`;
+        let elPath = "";
+        let reactComponents: string | null = null;
+        let nearbyText: string | undefined;
+        let cssClasses: string | undefined;
+        let fullPath: string | undefined;
+        let accessibility: string | undefined;
+        let computedStylesStr: string | undefined;
+        let computedStylesObj: Record<string, string> | undefined;
+        let nearbyElements: string | undefined;
+        let boundingBox: { x: number; y: number; width: number; height: number } | undefined;
+
+        if (centerEl) {
+          const info = identifyElementWithReact(centerEl, effectiveReactMode);
+          name = `Drawing: ${gestureShape} → ${info.name}`;
+          elPath = info.path;
+          reactComponents = info.reactComponents;
+          nearbyText = getNearbyText(centerEl);
+          cssClasses = getElementClasses(centerEl);
+          fullPath = getFullElementPath(centerEl);
+          accessibility = getAccessibilityInfo(centerEl);
+          computedStylesStr = getForensicComputedStyles(centerEl);
+          computedStylesObj = getDetailedComputedStyles(centerEl);
+          nearbyElements = getNearbyElements(centerEl);
+          const rect = centerEl.getBoundingClientRect();
+          boundingBox = {
+            x: rect.left,
+            y: isFixed ? rect.top : rect.top + window.scrollY,
+            width: rect.width,
+            height: rect.height,
+          };
+        }
+
+        canvas.style.display = "";
+
+        setDrawStrokes(prev => [...prev, newStroke]);
+
+        // Immediately open annotation popup for the new drawing
+        const annX = (centerX / window.innerWidth) * 100;
+        const annY = isFixed ? centerY : centerY + window.scrollY;
+
+        setPendingAnnotation({
+          x: annX,
+          y: annY,
+          clientY: centerY,
+          element: name,
+          elementPath: elPath,
+          boundingBox,
+          nearbyText,
+          cssClasses,
+          isFixed,
+          fullPath,
+          accessibility,
+          computedStyles: computedStylesStr,
+          computedStylesObj,
+          nearbyElements,
+          reactComponents: reactComponents ?? undefined,
+          targetElement: centerEl ?? undefined,
+          drawingIndex: newStrokeIdx,
+        });
+        setHoverInfo(null);
+      }
+      currentStrokeRef.current = [];
+    };
+
+    const handleMouseLeave = (e: MouseEvent) => {
+      handleMouseUp(e);
+      setHoveredDrawingIdx(null);
+      canvas.style.cursor = "crosshair";
+    };
+
+    canvas.addEventListener("mousedown", handleMouseDown);
+    canvas.addEventListener("mousemove", handleMouseMove);
+    canvas.addEventListener("mouseup", handleMouseUp);
+    canvas.addEventListener("mouseleave", handleMouseLeave);
+
+    return () => {
+      canvas.removeEventListener("mousedown", handleMouseDown);
+      canvas.removeEventListener("mousemove", handleMouseMove);
+      canvas.removeEventListener("mouseup", handleMouseUp);
+      canvas.removeEventListener("mouseleave", handleMouseLeave);
+    };
+  }, [isDrawMode, isActive, settings.annotationColor, drawStrokes, annotations, effectiveReactMode, redrawCanvas, startEditAnnotation]);
+
+  // Draw mode: resize canvas, redraw on scroll
+  useEffect(() => {
+    if (!isActive) return;
+    const canvas = drawCanvasRef.current;
+    if (!canvas) return;
+
+    const effectiveHighlight = hoveredDrawingIdx ?? pendingAnnotation?.drawingIndex ?? null;
+
+    const resize = () => {
+      const dpr = window.devicePixelRatio || 1;
+      canvas.style.width = window.innerWidth + "px";
+      canvas.style.height = window.innerHeight + "px";
+      canvas.width = window.innerWidth * dpr;
+      canvas.height = window.innerHeight * dpr;
+      const ctx = canvas.getContext("2d");
+      if (ctx) redrawCanvas(ctx, drawStrokes, effectiveHighlight);
+    };
+
+    const onScroll = () => {
+      const ctx = canvas.getContext("2d");
+      if (ctx) redrawCanvas(ctx, drawStrokes, effectiveHighlight);
+    };
+
+    resize();
+    window.addEventListener("resize", resize);
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      window.removeEventListener("resize", resize);
+      window.removeEventListener("scroll", onScroll);
+    };
+  }, [isActive, drawStrokes, hoveredDrawingIdx, pendingAnnotation?.drawingIndex, redrawCanvas]);
+
   // Fire webhook for annotation events - returns true on success, false on failure
   const fireWebhook = useCallback(
     async (
@@ -2209,6 +2847,7 @@ export function PageFeedbackToolbarCSS({
         nearbyElements: pendingAnnotation.nearbyElements,
         reactComponents: pendingAnnotation.reactComponents,
         elementBoundingBoxes: pendingAnnotation.elementBoundingBoxes,
+        drawingIndex: pendingAnnotation.drawingIndex,
         // Protocol fields for server sync
         ...(endpoint && currentSessionId
           ? {
@@ -2284,12 +2923,23 @@ export function PageFeedbackToolbarCSS({
 
   // Cancel annotation with exit animation
   const cancelAnnotation = useCallback(() => {
+    // If cancelling a drawing-linked annotation, also remove the drawing
+    if (pendingAnnotation?.drawingIndex != null) {
+      const idx = pendingAnnotation.drawingIndex;
+      setDrawStrokes(prev => prev.filter((_, i) => i !== idx));
+      // Shift drawingIndex on annotations pointing to higher indices
+      setAnnotations(prev => prev.map(a =>
+        a.drawingIndex != null && a.drawingIndex > idx
+          ? { ...a, drawingIndex: a.drawingIndex - 1 }
+          : a
+      ));
+    }
     setPendingExiting(true);
     originalSetTimeout(() => {
       setPendingAnnotation(null);
       setPendingExiting(false);
     }, 150); // Match exit animation duration
-  }, []);
+  }, [pendingAnnotation]);
 
   // Delete annotation with exit animation
   const deleteAnnotation = useCallback(
@@ -2327,9 +2977,34 @@ export function PageFeedbackToolbarCSS({
         });
       }
 
+      // Also delete linked drawing stroke
+      const drawingIdx = deletedAnnotation?.drawingIndex;
+
       // Wait for exit animation then remove
       originalSetTimeout(() => {
-        setAnnotations((prev) => prev.filter((a) => a.id !== id));
+        setAnnotations((prev) => {
+          let next = prev.filter((a) => a.id !== id);
+          // If we're removing a linked drawing, shift drawingIndex on annotations pointing to higher indices
+          if (drawingIdx != null) {
+            next = next.map(a =>
+              a.drawingIndex != null && a.drawingIndex > drawingIdx
+                ? { ...a, drawingIndex: a.drawingIndex - 1 }
+                : a
+            );
+          }
+          return next;
+        });
+        // Remove the linked drawing stroke
+        if (drawingIdx != null) {
+          setDrawStrokes(prev => prev.filter((_, i) => i !== drawingIdx));
+          const canvas = drawCanvasRef.current;
+          if (canvas) {
+            const ctx = canvas.getContext("2d");
+            if (ctx) {
+              // Redraw will happen via the effect when drawStrokes changes
+            }
+          }
+        }
         setExitingMarkers((prev) => {
           const next = new Set(prev);
           next.delete(id);
@@ -2347,55 +3022,6 @@ export function PageFeedbackToolbarCSS({
     [annotations, editingAnnotation, onAnnotationDelete, fireWebhook, endpoint],
   );
 
-  // Start editing an annotation (right-click)
-  const startEditAnnotation = useCallback((annotation: Annotation) => {
-    setEditingAnnotation(annotation);
-    setHoveredMarkerId(null);
-    setHoveredTargetElement(null);
-    setHoveredTargetElements([]);
-
-    // Try to find elements at the annotation's position(s) for live tracking
-    if (annotation.elementBoundingBoxes?.length) {
-      // Cmd+shift+click: find element at each bounding box center
-      const elements: HTMLElement[] = [];
-      for (const bb of annotation.elementBoundingBoxes) {
-        const centerX = bb.x + bb.width / 2;
-        const centerY = bb.y + bb.height / 2 - window.scrollY;
-        const el = deepElementFromPoint(centerX, centerY);
-        if (el) elements.push(el);
-      }
-      setEditingTargetElements(elements);
-      setEditingTargetElement(null);
-    } else if (annotation.boundingBox) {
-      // Single element
-      const bb = annotation.boundingBox;
-      const centerX = bb.x + bb.width / 2;
-      // Convert document coords to viewport coords (unless fixed)
-      const centerY = annotation.isFixed
-        ? bb.y + bb.height / 2
-        : bb.y + bb.height / 2 - window.scrollY;
-      const el = deepElementFromPoint(centerX, centerY);
-
-      // Validate found element's size roughly matches stored bounding box
-      if (el) {
-        const elRect = el.getBoundingClientRect();
-        const widthRatio = elRect.width / bb.width;
-        const heightRatio = elRect.height / bb.height;
-        if (widthRatio < 0.5 || heightRatio < 0.5) {
-          setEditingTargetElement(null);
-        } else {
-          setEditingTargetElement(el);
-        }
-      } else {
-        setEditingTargetElement(null);
-      }
-      setEditingTargetElements([]);
-    } else {
-      setEditingTargetElement(null);
-      setEditingTargetElements([]);
-    }
-  }, []);
-
   // Handle marker hover - finds element(s) for live position tracking
   const handleMarkerHover = useCallback(
     (annotation: Annotation | null) => {
@@ -2403,10 +3029,18 @@ export function PageFeedbackToolbarCSS({
         setHoveredMarkerId(null);
         setHoveredTargetElement(null);
         setHoveredTargetElements([]);
+        setHoveredDrawingIdx(null);
         return;
       }
 
       setHoveredMarkerId(annotation.id);
+
+      // Highlight linked drawing stroke when marker is hovered
+      if (annotation.drawingIndex != null && annotation.drawingIndex < drawStrokes.length) {
+        setHoveredDrawingIdx(annotation.drawingIndex);
+      } else {
+        setHoveredDrawingIdx(null);
+      }
 
       // Find elements at the annotation's position(s) for live tracking
       if (annotation.elementBoundingBoxes?.length) {
@@ -2454,7 +3088,7 @@ export function PageFeedbackToolbarCSS({
         setHoveredTargetElements([]);
       }
     },
-    [],
+    [drawStrokes],
   );
 
   // Update annotation (edit mode submit)
@@ -2512,7 +3146,7 @@ export function PageFeedbackToolbarCSS({
   // Clear all with staggered animation
   const clearAll = useCallback(() => {
     const count = annotations.length;
-    if (count === 0) return;
+    if (count === 0 && drawStrokes.length === 0) return;
 
     // Fire callback with all annotations before clearing
     onAnnotationsClear?.(annotations);
@@ -2535,6 +3169,14 @@ export function PageFeedbackToolbarCSS({
     setIsClearing(true);
     setCleared(true);
 
+    // Clear draw strokes
+    setDrawStrokes([]);
+    const canvas = drawCanvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext("2d");
+      if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
     const totalAnimationTime = count * 30 + 200;
     originalSetTimeout(() => {
       setAnnotations([]);
@@ -2544,7 +3186,7 @@ export function PageFeedbackToolbarCSS({
     }, totalAnimationTime);
 
     originalSetTimeout(() => setCleared(false), 1500);
-  }, [pathname, annotations, onAnnotationsClear, fireWebhook, endpoint]);
+  }, [pathname, annotations, drawStrokes, onAnnotationsClear, fireWebhook, endpoint]);
 
   // Copy output
   const copyOutput = useCallback(async () => {
@@ -2554,13 +3196,136 @@ export function PageFeedbackToolbarCSS({
           window.location.search +
           window.location.hash
         : pathname;
-    const output = generateOutput(
+    let output = generateOutput(
       annotations,
       displayUrl,
       settings.outputDetail,
       effectiveReactMode,
     );
-    if (!output) return;
+    if (!output && drawStrokes.length === 0) return;
+    if (!output) output = `## Page Feedback: ${displayUrl}\n`;
+
+    // Describe draw strokes as text by detecting elements underneath
+    if (drawStrokes.length > 0) {
+      // Collect drawing indices that have linked annotations (skip those in standalone section)
+      const linkedDrawingIndices = new Set<number>();
+      for (const a of annotations) {
+        if (a.drawingIndex != null) linkedDrawingIndices.add(a.drawingIndex);
+      }
+
+      // Temporarily hide the draw canvas so elementFromPoint hits real page elements
+      const canvas = drawCanvasRef.current;
+      if (canvas) canvas.style.display = "none";
+
+      const strokeDescriptions: string[] = [];
+      const scrollY = window.scrollY;
+      for (let strokeIdx = 0; strokeIdx < drawStrokes.length; strokeIdx++) {
+        // Skip strokes that have a linked annotation — their info is in the annotation output
+        if (linkedDrawingIndices.has(strokeIdx)) continue;
+        const stroke = drawStrokes[strokeIdx];
+        if (stroke.points.length < 2) continue;
+
+        // Get viewport coords for analysis (fixed strokes are already in viewport coords)
+        const viewportPoints = stroke.fixed
+          ? stroke.points
+          : stroke.points.map(p => ({ x: p.x, y: p.y - scrollY }));
+
+        // Bounding box (viewport coords)
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const p of viewportPoints) {
+          minX = Math.min(minX, p.x);
+          minY = Math.min(minY, p.y);
+          maxX = Math.max(maxX, p.x);
+          maxY = Math.max(maxY, p.y);
+        }
+        const bboxW = maxX - minX;
+        const bboxH = maxY - minY;
+        const bboxDiag = Math.hypot(bboxW, bboxH);
+
+        // Start/end analysis
+        const start = viewportPoints[0];
+        const end = viewportPoints[viewportPoints.length - 1];
+        const startEndDist = Math.hypot(end.x - start.x, end.y - start.y);
+
+        // Gesture classification
+        let gesture: "circle" | "box" | "underline" | "arrow" | "drawing";
+        const closedLoop = startEndDist < bboxDiag * 0.35;
+        const aspectRatio = bboxW / Math.max(bboxH, 1);
+
+        if (closedLoop && bboxDiag > 20) {
+          // Closed loop — circle vs box: measure how many points hug the bbox edges
+          // Box strokes spend time near edges; circles stay more centered
+          const edgeThreshold = Math.max(bboxW, bboxH) * 0.15;
+          let edgePoints = 0;
+          for (const p of viewportPoints) {
+            const nearLeft = p.x - minX < edgeThreshold;
+            const nearRight = maxX - p.x < edgeThreshold;
+            const nearTop = p.y - minY < edgeThreshold;
+            const nearBottom = maxY - p.y < edgeThreshold;
+            if ((nearLeft || nearRight) && (nearTop || nearBottom)) edgePoints++;
+          }
+          // If many points are near corners, it's a box
+          gesture = edgePoints > viewportPoints.length * 0.15 ? "box" : "circle";
+        } else if (aspectRatio > 3 && bboxH < 40) {
+          gesture = "underline";
+        } else if (startEndDist > bboxDiag * 0.5) {
+          gesture = "arrow";
+        } else {
+          gesture = "drawing";
+        }
+
+        // Sample elements along the stroke
+        const sampleCount = Math.min(10, viewportPoints.length);
+        const step = Math.max(1, Math.floor(viewportPoints.length / sampleCount));
+        const seenElements = new Set<HTMLElement>();
+        const elementNames: string[] = [];
+
+        const samplePoints = [start];
+        for (let i = step; i < viewportPoints.length - 1; i += step) {
+          samplePoints.push(viewportPoints[i]);
+        }
+        samplePoints.push(end);
+
+        for (const p of samplePoints) {
+          const el = deepElementFromPoint(p.x, p.y);
+          if (!el || seenElements.has(el)) continue;
+          if (closestCrossingShadow(el, "[data-feedback-toolbar]")) continue;
+          seenElements.add(el);
+          const { name } = identifyElement(el);
+          if (!elementNames.includes(name)) {
+            elementNames.push(name);
+          }
+        }
+
+        // Format description
+        const region = `${Math.round(minX)},${Math.round(minY)} → ${Math.round(maxX)},${Math.round(maxY)}`;
+        let desc: string;
+
+        if ((gesture === "circle" || gesture === "box") && elementNames.length > 0) {
+          const verb = gesture === "box" ? "Boxed" : "Circled";
+          desc = `${verb} **${elementNames[0]}**${elementNames.length > 1 ? ` (and ${elementNames.slice(1).join(", ")})` : ""} (region: ${region})`;
+        } else if (gesture === "underline" && elementNames.length > 0) {
+          desc = `Underlined **${elementNames[0]}** (${region})`;
+        } else if (gesture === "arrow" && elementNames.length >= 2) {
+          desc = `Arrow from **${elementNames[0]}** to **${elementNames[elementNames.length - 1]}** (${Math.round(start.x)},${Math.round(start.y)} → ${Math.round(end.x)},${Math.round(end.y)})`;
+        } else if (elementNames.length > 0) {
+          desc = `${gesture === "arrow" ? "Arrow" : "Drawing"} near **${elementNames.join("**, **")}** (region: ${region})`;
+        } else {
+          desc = `Drawing at ${region}`;
+        }
+        strokeDescriptions.push(desc);
+      }
+
+      // Restore canvas
+      if (canvas) canvas.style.display = "";
+
+      if (strokeDescriptions.length > 0) {
+        output += `\n**Drawings:**\n`;
+        strokeDescriptions.forEach((d, i) => {
+          output += `${i + 1}. ${d}\n`;
+        });
+      }
+    }
 
     if (copyToClipboard) {
       try {
@@ -2581,6 +3346,7 @@ export function PageFeedbackToolbarCSS({
     }
   }, [
     annotations,
+    drawStrokes,
     pathname,
     settings.outputDetail,
     effectiveReactMode,
@@ -2662,15 +3428,15 @@ export function PageFeedbackToolbarCSS({
 
         // Constrain to viewport
         const padding = 20;
-        const wrapperWidth = 297; // .toolbar wrapper width
+        const wrapperWidth = 337; // .toolbar wrapper width
         const toolbarHeight = 44;
 
         // Content is right-aligned within wrapper via margin-left: auto
         // Calculate content width based on state
         const contentWidth = isActive
           ? connectionStatus === "connected"
-            ? 297
-            : 257
+            ? 337
+            : 297
           : 44; // collapsed circle
 
         // Content offset from wrapper left edge
@@ -2751,7 +3517,7 @@ export function PageFeedbackToolbarCSS({
 
     const constrainPosition = () => {
       const padding = 20;
-      const wrapperWidth = 297; // .toolbar wrapper width
+      const wrapperWidth = 337; // .toolbar wrapper width
       const toolbarHeight = 44;
 
       let newX = toolbarPosition.x;
@@ -2803,6 +3569,11 @@ export function PageFeedbackToolbarCSS({
         target.isContentEditable;
 
       if (e.key === "Escape") {
+        // Exit draw mode first if active
+        if (isDrawMode) {
+          setIsDrawMode(false);
+          return;
+        }
         // Clear multi-select if active
         if (pendingMultiSelectElements.length > 0) {
           setPendingMultiSelectElements([]);
@@ -2824,6 +3595,21 @@ export function PageFeedbackToolbarCSS({
         return;
       }
 
+      // Cmd+Z in draw mode: undo last stroke
+      if ((e.metaKey || e.ctrlKey) && (e.key === "z" || e.key === "Z") && isDrawMode && !e.shiftKey) {
+        e.preventDefault();
+        setDrawStrokes(prev => {
+          const next = prev.slice(0, -1);
+          const canvas = drawCanvasRef.current;
+          if (canvas) {
+            const ctx = canvas.getContext("2d");
+            if (ctx) redrawCanvas(ctx, next);
+          }
+          return next;
+        });
+        return;
+      }
+
       // Skip other shortcuts if typing or modifier keys are held
       if (isTyping || e.metaKey || e.ctrlKey) return;
 
@@ -2832,6 +3618,13 @@ export function PageFeedbackToolbarCSS({
         e.preventDefault();
         hideTooltipsUntilMouseLeave();
         toggleFreeze();
+      }
+
+      // "D" to toggle draw mode
+      if (e.key === "d" || e.key === "D") {
+        e.preventDefault();
+        hideTooltipsUntilMouseLeave();
+        setIsDrawMode(prev => !prev);
       }
 
       // "H" to toggle marker visibility
@@ -2881,6 +3674,7 @@ export function PageFeedbackToolbarCSS({
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [
     isActive,
+    isDrawMode,
     pendingAnnotation,
     annotations.length,
     settings.webhookUrl,
@@ -2890,6 +3684,7 @@ export function PageFeedbackToolbarCSS({
     toggleFreeze,
     copyOutput,
     clearAll,
+    redrawCanvas,
     pendingMultiSelectElements,
   ]);
 
@@ -3049,6 +3844,24 @@ export function PageFeedbackToolbarCSS({
                 onClick={(e) => {
                   e.stopPropagation();
                   hideTooltipsUntilMouseLeave();
+                  setIsDrawMode(prev => !prev);
+                }}
+                data-active={isDrawMode}
+              >
+                <IconPencil size={24} />
+              </button>
+              <span className={styles.buttonTooltip}>
+                {isDrawMode ? "Exit draw mode" : "Draw mode"}
+                <span className={styles.shortcut}>D</span>
+              </span>
+            </div>
+
+            <div className={styles.buttonWrapper}>
+              <button
+                className={`${styles.controlButton} ${!isDarkMode ? styles.light : ""}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  hideTooltipsUntilMouseLeave();
                   setShowMarkers(!showMarkers);
                 }}
                 disabled={!hasAnnotations}
@@ -3069,7 +3882,7 @@ export function PageFeedbackToolbarCSS({
                   hideTooltipsUntilMouseLeave();
                   copyOutput();
                 }}
-                disabled={!hasAnnotations}
+                disabled={!hasAnnotations && drawStrokes.length === 0}
                 data-active={copied}
               >
                 <IconCopyAnimated size={24} copied={copied} />
@@ -3129,7 +3942,7 @@ export function PageFeedbackToolbarCSS({
                   hideTooltipsUntilMouseLeave();
                   clearAll();
                 }}
-                disabled={!hasAnnotations}
+                disabled={!hasAnnotations && drawStrokes.length === 0}
                 data-danger
               >
                 <IconTrashAlt size={24} />
@@ -3613,6 +4426,7 @@ export function PageFeedbackToolbarCSS({
 
               const showDeleteHover =
                 showDeleteState && settings.markerClickBehavior === "delete";
+              const drawingHovered = hoveredDrawingIdx !== null && annotation.drawingIndex === hoveredDrawingIdx;
               return (
                 <div
                   key={annotation.id}
@@ -3625,6 +4439,7 @@ export function PageFeedbackToolbarCSS({
                     animationDelay: markersExiting
                       ? `${(visibleAnnotations.length - 1 - index) * 20}ms`
                       : `${index * 20}ms`,
+                    ...(drawingHovered ? { transform: "translate(-50%, -50%) scale(1.3)", transition: "transform 0.15s ease" } : {}),
                   }}
                   onMouseEnter={() =>
                     !markersExiting &&
@@ -3741,6 +4556,7 @@ export function PageFeedbackToolbarCSS({
 
               const showDeleteHover =
                 showDeleteState && settings.markerClickBehavior === "delete";
+              const drawingHovered = hoveredDrawingIdx !== null && annotation.drawingIndex === hoveredDrawingIdx;
               return (
                 <div
                   key={annotation.id}
@@ -3753,6 +4569,7 @@ export function PageFeedbackToolbarCSS({
                     animationDelay: markersExiting
                       ? `${(fixedAnnotations.length - 1 - index) * 20}ms`
                       : `${index * 20}ms`,
+                    ...(drawingHovered ? { transform: "translate(-50%, -50%) scale(1.3)", transition: "transform 0.15s ease" } : {}),
                   }}
                   onMouseEnter={() =>
                     !markersExiting &&
@@ -3848,11 +4665,18 @@ export function PageFeedbackToolbarCSS({
               : undefined
           }
         >
+          {/* Draw canvas */}
+          <canvas
+            ref={drawCanvasRef}
+            className={`${styles.drawCanvas} ${isDrawMode ? styles.active : ""}`}
+          />
+
           {/* Hover highlight */}
           {hoverInfo?.rect &&
             !pendingAnnotation &&
             !isScrolling &&
-            !isDragging && (
+            !isDragging &&
+            !isDrawMode && (
               <div
                 className={`${styles.hoverHighlight} ${styles.enter}`}
                 style={{
@@ -3906,6 +4730,8 @@ export function PageFeedbackToolbarCSS({
                 (a) => a.id === hoveredMarkerId,
               );
               if (!hoveredAnnotation?.boundingBox) return null;
+              // Drawing-linked annotations highlight the stroke via canvas, not an element box
+              if (hoveredAnnotation.drawingIndex != null) return null;
 
               // Render individual element boxes if available (cmd+shift+click multi-select)
               if (hoveredAnnotation.elementBoundingBoxes?.length) {
@@ -3984,7 +4810,7 @@ export function PageFeedbackToolbarCSS({
             })()}
 
           {/* Hover tooltip */}
-          {hoverInfo && !pendingAnnotation && !isScrolling && !isDragging && (
+          {hoverInfo && !pendingAnnotation && !isScrolling && !isDragging && !isDrawMode && (
             <div
               className={`${styles.hoverTooltip} ${styles.enter}`}
               style={{
@@ -4012,8 +4838,10 @@ export function PageFeedbackToolbarCSS({
           {/* Pending annotation marker + popup */}
           {pendingAnnotation && (
             <>
-              {/* Show element/area outline while adding annotation */}
-              {pendingAnnotation.multiSelectElements?.length
+              {/* Show element/area outline while adding annotation (skip for drawing-linked annotations — drawing is the highlight) */}
+              {pendingAnnotation.drawingIndex != null
+                ? null
+                : pendingAnnotation.multiSelectElements?.length
                 ? // Cmd+shift+click multi-select: show individual boxes with live positions
                   pendingAnnotation.multiSelectElements
                     .filter((el) => document.contains(el))
