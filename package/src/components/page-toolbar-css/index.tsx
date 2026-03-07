@@ -260,6 +260,10 @@ function formatRelativeTime(dateString: string): string {
   return date.toLocaleDateString();
 }
 
+function isRenderableAnnotation(annotation: Annotation): boolean {
+  return annotation.status !== "resolved" && annotation.status !== "dismissed";
+}
+
 function truncateUrl(url: string): string {
   try {
     const parsed = new URL(url);
@@ -822,7 +826,7 @@ export function PageFeedbackToolbarCSS({
     setMounted(true);
     setScrollY(window.scrollY);
     const stored = loadAnnotations<Annotation>(pathname);
-    setAnnotations(stored);
+    setAnnotations(stored.filter(isRenderableAnnotation));
 
     // Trigger entrance animation only on first load (not on SPA navigation)
     if (!hasPlayedEntranceAnimation) {
@@ -969,17 +973,19 @@ export function PageFeedbackToolbarCSS({
                 ...session.annotations,
                 ...syncedAnnotations,
               ];
-              setAnnotations(allAnnotations);
+              setAnnotations(allAnnotations.filter(isRenderableAnnotation));
               saveAnnotationsWithSyncMarker(
                 pathname,
-                allAnnotations,
+                allAnnotations.filter(isRenderableAnnotation),
                 session.id,
               );
             } else {
-              setAnnotations(session.annotations);
+              setAnnotations(
+                session.annotations.filter(isRenderableAnnotation),
+              );
               saveAnnotationsWithSyncMarker(
                 pathname,
-                session.annotations,
+                session.annotations.filter(isRenderableAnnotation),
                 session.id,
               );
             }
@@ -1053,10 +1059,14 @@ export function PageFeedbackToolbarCSS({
                     return unsyncedAnnotations[i];
                   });
 
+                  const renderableSyncedAnnotations = syncedAnnotations.filter(
+                    isRenderableAnnotation,
+                  );
+
                   // Save with sync marker
                   saveAnnotationsWithSyncMarker(
                     pagePath,
-                    syncedAnnotations,
+                    renderableSyncedAnnotations,
                     targetSession.id,
                   );
 
@@ -1068,7 +1078,7 @@ export function PageFeedbackToolbarCSS({
                       const newDuringSync = prev.filter(
                         (a) => !originalIds.has(a.id),
                       );
-                      return [...syncedAnnotations, ...newDuringSync];
+                      return [...renderableSyncedAnnotations, ...newDuringSync];
                     });
                   }
                 } catch (err) {
@@ -1225,8 +1235,15 @@ export function PageFeedbackToolbarCSS({
 
             // Update local state with server + synced annotations
             const allAnnotations = [...serverAnnotations, ...syncedAnnotations];
-            setAnnotations(allAnnotations);
-            saveAnnotationsWithSyncMarker(pathname, allAnnotations, sessionId!);
+            const renderableAnnotations = allAnnotations.filter(
+              isRenderableAnnotation,
+            );
+            setAnnotations(renderableAnnotations);
+            saveAnnotationsWithSyncMarker(
+              pathname,
+              renderableAnnotations,
+              sessionId!,
+            );
           }
         } catch (err) {
           console.warn("[Agentation] Failed to sync on reconnect:", err);
@@ -2944,7 +2961,7 @@ export function PageFeedbackToolbarCSS({
 
   // Filter annotations for rendering (exclude exiting ones from normal flow)
   const visibleAnnotations = annotations.filter(
-    (a) => !exitingMarkers.has(a.id),
+    (a) => !exitingMarkers.has(a.id) && isRenderableAnnotation(a),
   );
   const exitingAnnotationsList = annotations.filter((a) =>
     exitingMarkers.has(a.id),
