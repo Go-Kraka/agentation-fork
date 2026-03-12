@@ -2,6 +2,13 @@
   "name": "agentation-monorepo",
   "version": "0.0.1",
   "private": true,
+  "exports": {
+    ".": {
+      "types": "./package/dist/index.d.ts",
+      "import": "./package/dist/index.mjs",
+      "require": "./package/dist/index.js"
+    }
+  },
   "scripts": {
     "dev": "pnpm --filter agentation watch & pnpm --filter feedback-tool-example dev",
     "build": "pnpm --filter agentation build",
