@@ -228,6 +228,28 @@ function handleCors(res: ServerResponse): void {
 // -----------------------------------------------------------------------------
 
 /**
+ * Allowlist of path patterns valid for cloud proxying.
+ * Derived from the local route table — cloud API supports the same routes.
+ */
+const CLOUD_ALLOWED_PATTERNS: RegExp[] = [
+  /^\/events$/,
+  /^\/pending$/,
+  /^\/sessions$/,
+  /^\/sessions\/[^/]+$/,
+  /^\/sessions\/[^/]+\/events$/,
+  /^\/sessions\/[^/]+\/pending$/,
+  /^\/sessions\/[^/]+\/action$/,
+  /^\/sessions\/[^/]+\/annotations$/,
+  /^\/annotations\/[^/]+$/,
+  /^\/annotations\/[^/]+\/thread$/,
+];
+
+function isAllowedCloudPath(pathname: string): boolean {
+  if (pathname.includes("..")) return false;
+  return CLOUD_ALLOWED_PATTERNS.some((pattern) => pattern.test(pathname));
+}
+
+/**
  * Proxy a request to the cloud API.
  */
 async function proxyToCloud(
@@ -236,6 +258,13 @@ async function proxyToCloud(
   pathname: string
 ): Promise<void> {
   const method = req.method || "GET";
+
+  // Validate pathname against allowed routes before proxying
+  const pathOnly = pathname.split("?")[0];
+  if (!isAllowedCloudPath(pathOnly)) {
+    return sendError(res, 404, "Not found");
+  }
+
   const cloudUrl = `${CLOUD_API_URL}${pathname}`;
 
   const headers: Record<string, string> = {
