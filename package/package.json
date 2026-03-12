@@ -29,6 +29,7 @@
     "dev": "pnpm build && pnpm watch",
     "test": "vitest run",
     "test:watch": "vitest",
+    "prepare": "tsup",
     "prepublishOnly": "pnpm build"
   },
   "peerDependencies": {
