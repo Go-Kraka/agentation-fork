@@ -998,12 +998,12 @@ export function startHttpServer(port: number, apiKey?: string): void {
       return handleMcp(req, res);
     }
 
-    // Cloud mode: proxy all other requests to cloud API
-    if (isCloudMode()) {
-      return proxyToCloud(req, res, pathname + url.search);
-    }
-
-    // Local mode: use local store
+    // Always use local store (cloud proxying disabled)
+    //
+    // The proxyToCloud() function still exists in this file but is never
+    // called. It was disabled because forwarding arbitrary requests to a
+    // remote API introduces supply-chain and path-traversal risks that
+    // are unnecessary for the local-first architecture of this fork.
     const match = matchRoute(method, pathname);
     if (!match) {
       return sendError(res, 404, "Not found");
