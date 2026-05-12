@@ -143,7 +143,7 @@ function initDatabase(db: Database.Database): void {
 // -----------------------------------------------------------------------------
 
 function generateId(): string {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  return `${Date.now().toString(36)}-${randomBytes(6).toString("hex")}`;
 }
 
 function rowToSession(row: Record<string, unknown>): Session & { userId?: string } {

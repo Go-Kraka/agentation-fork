@@ -9,6 +9,7 @@
  *   const session = store.createSession('http://localhost:3000');
  */
 
+import { randomBytes } from "crypto";
 import type {
   AFSStore,
   AFSEvent,
@@ -70,7 +71,7 @@ function createMemoryStore(): AFSStore {
   const events: AFSEvent[] = [];
 
   function generateId(): string {
-    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    return `${Date.now().toString(36)}-${randomBytes(6).toString("hex")}`;
   }
 
   return {
