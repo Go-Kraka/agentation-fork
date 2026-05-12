@@ -329,7 +329,7 @@ function initDatabase(db) {
   `);
 }
 function generateId() {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  return `${Date.now().toString(36)}-${randomBytes(6).toString("hex")}`;
 }
 function rowToSession(row) {
   return {
@@ -1468,6 +1468,7 @@ async function startMcpServer(baseUrl) {
 
 // src/server/store.ts
 init_events();
+import { randomBytes as randomBytes2 } from "crypto";
 var _store = null;
 function getStore() {
   if (!_store) {
@@ -1495,7 +1496,7 @@ function createMemoryStore() {
   const annotations = /* @__PURE__ */ new Map();
   const events = [];
   function generateId2() {
-    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    return `${Date.now().toString(36)}-${randomBytes2(6).toString("hex")}`;
   }
   return {
     createSession(url, projectId) {

@@ -911,7 +911,7 @@ function initDatabase(db) {
   `);
 }
 function generateId() {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  return `${Date.now().toString(36)}-${(0, import_crypto.randomBytes)(6).toString("hex")}`;
 }
 function rowToSession(row) {
   return {
@@ -1502,7 +1502,7 @@ function createMemoryStore() {
   const annotations = /* @__PURE__ */ new Map();
   const events = [];
   function generateId2() {
-    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    return `${Date.now().toString(36)}-${(0, import_crypto2.randomBytes)(6).toString("hex")}`;
   }
   return {
     createSession(url, projectId) {
@@ -1686,10 +1686,11 @@ function clearAll() {
   getStore().close();
   _store = null;
 }
-var _store, store;
+var import_crypto2, _store, store;
 var init_store = __esm({
   "src/server/store.ts"() {
     "use strict";
+    import_crypto2 = require("crypto");
     init_events();
     _store = null;
     store = {

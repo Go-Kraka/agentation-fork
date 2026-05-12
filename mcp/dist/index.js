@@ -335,7 +335,7 @@ function initDatabase(db) {
   `);
 }
 function generateId() {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  return `${Date.now().toString(36)}-${(0, import_crypto.randomBytes)(6).toString("hex")}`;
 }
 function rowToSession(row) {
   return {
@@ -1522,6 +1522,7 @@ async function startMcpServer(baseUrl) {
 }
 
 // src/server/store.ts
+var import_crypto2 = require("crypto");
 init_events();
 var _store = null;
 function getStore() {
@@ -1550,7 +1551,7 @@ function createMemoryStore() {
   const annotations = /* @__PURE__ */ new Map();
   const events = [];
   function generateId2() {
-    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    return `${Date.now().toString(36)}-${(0, import_crypto2.randomBytes)(6).toString("hex")}`;
   }
   return {
     createSession(url, projectId) {
@@ -2332,7 +2333,7 @@ function startHttpServer(port, apiKey2) {
 init_events();
 
 // src/server/tenant-store.ts
-var import_crypto2 = require("crypto");
+var import_crypto3 = require("crypto");
 var _tenantStore = null;
 function getTenantStore() {
   if (!_tenantStore) {
@@ -2358,7 +2359,7 @@ function resetTenantStore() {
   }
 }
 function hashApiKey(rawKey) {
-  return (0, import_crypto2.createHash)("sha256").update(rawKey).digest("hex");
+  return (0, import_crypto3.createHash)("sha256").update(rawKey).digest("hex");
 }
 function isValidApiKeyFormat(key) {
   return key.startsWith("sk_live_") && key.length > 20;
