@@ -2,6 +2,9 @@
   "name": "agentation-monorepo",
   "version": "0.0.1",
   "private": true,
+  "engines": {
+    "node": ">=20.9.0"
+  },
   "exports": {
     ".": {
       "types": "./package/dist/index.d.ts",
