@@ -78,7 +78,7 @@ Then **restart Claude Code** to load the MCP server.
 ## Requirements
 
 - React 18+
-- Node.js 18+
+- Node.js 20.9+
 - Desktop browser (mobile not supported)
 
 ## License
